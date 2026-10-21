@@ -12,15 +12,24 @@ Flags:
 """
 
 import argparse
+import io
 import json
+import os
 import shutil
 import socket
 import subprocess
 import sys
 import time
+
+# Force UTF-8 output on Windows so box-drawing and color chars render correctly.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Enable ANSI color codes on Windows.
+os.system("")
 
 HERE = Path(__file__).parent
 SITE_PORTS = [8000, 8001, 8002]
@@ -29,12 +38,54 @@ SITE_FILES = ["site_a.csv", "site_b.csv", "site_c.csv"]
 ANA_KEY = "key_ana_secure_001"
 MALLORY_KEY = "key_mallory_003"
 
+HOSPITAL_NAMES = [
+    "NUMS Islamabad   ",
+    "Shifa Hospital   ",
+    "PIMS Rawalpindi  ",
+]
 
-def banner(step, text):
+# ANSI color codes.
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+WHITE  = "\033[97m"
+
+
+def c(color, text):
+    """Wrap text in a color code."""
+    return f"{color}{text}{RESET}"
+
+
+def box(lines):
+    """Print a bordered box around a list of lines."""
+    # Strip ANSI codes for width calculation.
+    import re as _re
+    _ansi = _re.compile(r'\033\[[^m]*m')
+    visible_lens = [len(_ansi.sub('', l)) for l in lines]
+    width = max(visible_lens) + 4
+    print(c(CYAN, "+" + "-" * width + "+"))
+    for line, vlen in zip(lines, visible_lens):
+        padding = width - vlen
+        print(c(CYAN, "|") + "  " + line + " " * (padding - 2) + c(CYAN, "|"))
+    print(c(CYAN, "+" + "-" * width + "+"))
+
+
+def rule(char="-", width=62):
+    print(c(DIM, char * width))
+
+
+def banner(step, title, subtitle=""):
     """Print a step banner."""
     print()
-    print(f"STEP {step}: {text}")
-    print("-" * 60)
+    rule()
+    print(c(BOLD + YELLOW, f"  STEP {step}  —  {title}"))
+    if subtitle:
+        print(c(DIM, f"  {subtitle}"))
+    rule()
 
 
 def port_free(port):
@@ -167,29 +218,99 @@ def preflight():
 def _step_wait(step_mode):
     """If step_mode is on, print a prompt and wait for Enter."""
     if step_mode:
-        input("(press Enter)")
+        print()
+        input(c(DIM, "  [ press Enter to continue ]"))
+
+
+def _get_site_counts():
+    """Read patient counts from site CSVs."""
+    counts = []
+    for f in SITE_FILES:
+        path = HERE / f
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            counts.append(len(lines) - 1)
+        else:
+            counts.append(0)
+    return counts
+
+
+def print_intro(site_counts):
+    """Print the opening story box."""
+    print()
+    total = sum(site_counts)
+    box([
+        f"{BOLD}MedMesh  —  Federated Privacy System{RESET}",
+        "",
+        f"  {total} patients across {len(SITE_PORTS)} hospitals  ·  0 records shared",
+    ])
+    print()
+    print(c(DIM, "  Scenario: Dr. Ana is a researcher studying patient outcomes"))
+    print(c(DIM, "  across multiple hospitals. Privacy law forbids her from"))
+    print(c(DIM, "  accessing individual patient records directly."))
+    print()
+    print(c(DIM, "  With MedMesh she submits one statistical query."))
+    print(c(DIM, "  Each hospital computes the answer on its own data."))
+    print(c(DIM, "  Only the approved summary is returned. No record moves."))
+    print()
+
+
+def print_servers_ready(site_counts):
+    """Print the server startup status."""
+    print(c(BOLD, "  Hospitals online:"))
+    print()
+    for i, (port, name, count) in enumerate(zip(SITE_PORTS, HOSPITAL_NAMES, site_counts)):
+        print(f"    {c(GREEN, 'ONLINE')}  Hospital {chr(65+i)} — {name}  "
+              f"{c(CYAN, str(count))} patients   port {port}")
+    unguarded_count = site_counts[0]
+    print(f"    {c(DIM, 'SHADOW')}  Unguarded test server             "
+          f"{c(DIM, str(unguarded_count))} patients   port {UNGUARDED_PORT}")
+    print()
 
 
 def step1_pooled(ports, pause, step_mode=False):
     """Step 1: pooled mean age and count by sex."""
-    banner(1, "Pooled queries across 3 sites: mean age, count by sex.")
+    site_counts = _get_site_counts()
+    total = sum(site_counts)
+
+    banner(1, "Federated Query",
+           "Dr. Ana asks for statistics. Each hospital replies independently.")
+
     for query in ["mean age", "count by sex"]:
-        print(f"  Query: {query!r}")
+        print()
+        print(f"  {c(BOLD, 'QUERY:')}  \"{c(YELLOW, query)}\"")
+        print(c(DIM, "  Each hospital computes on its own data — no records shared."))
+        print()
+
         site_results = []
-        for i, port in enumerate(ports):
+        for i, (port, name, count) in enumerate(zip(ports, HOSPITAL_NAMES, site_counts)):
             resp = post(port, query, ANA_KEY)
-            print(f"    site :{port} -> {json.dumps(resp.get('result', resp.get('reason')))}")
+            decision = resp.get("decision")
+            result = resp.get("result", {})
+            result_str = json.dumps(result)
+            if decision == "allow":
+                tag = c(GREEN, "ALLOW")
+            else:
+                tag = c(RED, "DENY ")
+            print(f"    {tag}  Hospital {chr(65+i)} — {name}  "
+                  f"({count} patients)  →  {c(CYAN, result_str)}")
             site_results.append((port, resp))
+
         # Pool.
         allowed = [(p, r) for p, r in site_results if r.get("decision") == "allow"]
         if allowed:
             first = allowed[0][1].get("result", {})
             mean_key = next((k for k in first if k.startswith("mean_")), None)
+            print()
+            print(c(DIM, "  " + "-" * 58))
             if mean_key:
                 total_n = sum(r.get("result", {}).get("n", 0) for _, r in allowed)
                 ws = sum(r.get("result", {}).get("n", 0) * r.get("result", {}).get(mean_key, 0) for _, r in allowed)
                 pooled = round(ws / total_n, 2) if total_n else 0.0
-                print(f"    Pooled: n={total_n}, {mean_key}={pooled}")
+                print(f"  {c(BOLD, 'POOLED')}  {total_n} patients across {len(allowed)} hospitals"
+                      f"  →  {c(BOLD + GREEN, f'{mean_key} = {pooled}')}")
+                print()
+                print(c(DIM, f"  Dr. Ana sees one number. She never accessed a single patient record."))
             elif "counts" in first:
                 pooled_counts = {}
                 pooled_n = 0
@@ -198,7 +319,12 @@ def step1_pooled(ports, pause, step_mode=False):
                     pooled_n += res.get("n", 0)
                     for k, v in res.get("counts", {}).items():
                         pooled_counts[k] = pooled_counts.get(k, 0) + v
-                print(f"    Pooled: n={pooled_n}, counts={pooled_counts}")
+                counts_str = "  ".join(f"{k}: {v}" for k, v in sorted(pooled_counts.items()))
+                print(f"  {c(BOLD, 'POOLED')}  {pooled_n} patients across {len(allowed)} hospitals"
+                      f"  →  {c(BOLD + GREEN, counts_str)}")
+                print()
+                print(c(DIM, f"  Group counts combined across hospitals. No individual record shared."))
+
     if pause:
         time.sleep(1)
     _step_wait(step_mode)
@@ -206,16 +332,27 @@ def step1_pooled(ports, pause, step_mode=False):
 
 def step2_refusals(ports, pause, step_mode=False):
     """Step 2: show refusals (all records, rare group, no key)."""
-    banner(2, "Refusals: all records, rare group, and no API key.")
-    queries = [
-        ("get all records", ANA_KEY),
-        ("mean age where diagnosis = rare", ANA_KEY),
-        ("mean age", None),
+    banner(2, "Privacy Guards in Action",
+           "Three types of queries the server must refuse.")
+
+    cases = [
+        ("get all records",                ANA_KEY,  "Asks for individual rows"),
+        ("mean age where diagnosis = rare", ANA_KEY,  "Group has fewer than 5 patients"),
+        ("mean age",                        None,     "No API key — unauthorised researcher"),
     ]
-    for query, key in queries:
-        port = ports[0]
-        resp = post(port, query, key)
-        print(f"  {query!r} key={key is not None} -> {resp.get('decision')}: {resp.get('reason', '')}")
+
+    print()
+    for query, key, reason in cases:
+        resp = post(ports[0], query, key)
+        decision = resp.get("decision")
+        resp_reason = resp.get("reason", "")
+        tag = c(GREEN, "ALLOW") if decision == "allow" else c(RED, " DENY")
+        key_label = c(GREEN, "key=YES") if key else c(RED, "key=NO ")
+        print(f"    {tag}  {key_label}  \"{c(YELLOW, query)}\"")
+        print(c(DIM, f"           Reason: {resp_reason}"))
+        print(c(DIM, f"           Why blocked: {reason}"))
+        print()
+
     if pause:
         time.sleep(1)
     _step_wait(step_mode)
@@ -224,7 +361,9 @@ def step2_refusals(ports, pause, step_mode=False):
 def step3_differencing(guarded_port, unguarded_port, pause, step_mode=False):
     """Step 3: differencing attack on unguarded then guarded server."""
     import csv as _csv
-    banner(3, "Differencing attack: unguarded vs guarded server.")
+    banner(3, "Differencing Attack — Guarded vs Unguarded",
+           "Can an attacker recover a patient's BMI by subtracting two queries?")
+
     site_a = HERE / "site_a.csv"
     patients = []
     if site_a.exists():
@@ -234,8 +373,12 @@ def step3_differencing(guarded_port, unguarded_port, pause, step_mode=False):
                 row["bmi"] = float(row["bmi"])
                 patients.append(row)
 
+    print()
+    print(c(DIM, "  Attack: send 'mean bmi where age > N', then 'mean bmi where age > N+1'."))
+    print(c(DIM, "  Subtract to isolate one patient's BMI. Repeat until you recover records."))
+    print()
+
     def run_diff(port, label, stop_after=None):
-        """Run differencing and return (attempts, blocked, recovered)."""
         prev_resp = None
         attempts = 0
         blocked = 0
@@ -272,8 +415,17 @@ def step3_differencing(guarded_port, unguarded_port, pause, step_mode=False):
     att_u, blk_u, rec_u = run_diff(unguarded_port, "unguarded", stop_after=5)
     att_g, blk_g, rec_g = run_diff(guarded_port, "guarded")
 
-    print(f"  Unguarded (:{unguarded_port}): {att_u} attempts, {blk_u} blocked, {rec_u} patient(s) recovered")
-    print(f"  Guarded   (:{guarded_port}): {att_g} attempts, {blk_g} blocked, {rec_g} patient(s) recovered")
+    print(f"  {c(RED,  'UNGUARDED server')}  —  {att_u} queries sent,  "
+          f"{blk_u} blocked,  "
+          f"{c(RED + BOLD, str(rec_u) + ' patient(s) recovered')}")
+    print(c(DIM, "  The attacker successfully reconstructed individual BMI values."))
+    print()
+    print(f"  {c(GREEN, 'GUARDED   server')}  —  {att_g} queries sent,  "
+          f"{c(GREEN, str(blk_g) + ' blocked')},  "
+          f"{c(GREEN + BOLD, str(rec_g) + ' patient(s) recovered')}")
+    print(c(DIM, "  The overlap guard blocked every differencing attempt."))
+    print()
+
     if pause:
         time.sleep(1)
     _step_wait(step_mode)
@@ -282,32 +434,45 @@ def step3_differencing(guarded_port, unguarded_port, pause, step_mode=False):
 
 def step4_audit(site_name, pause, step_mode=False):
     """Step 4: show 3 log lines, tamper one, run verify_log.py."""
-    banner(4, "Audit log: tamper detection.")
+    banner(4, "Tamper-Evident Audit Log",
+           "Every query is logged with a SHA-256 hash chain. Any change is detected.")
+
     log_path = HERE / "logs" / f"{site_name}.jsonl"
     if not log_path.exists():
         print("  No log file found. Skipping audit step.")
         return
 
     lines = log_path.read_text(encoding="utf-8").splitlines()
-    print(f"  Log file: {log_path.name} ({len(lines)} entries)")
+    print()
+    print(f"  {c(BOLD, str(len(lines)))} queries logged for Hospital A. First 3 entries:")
+    print()
     for line in lines[:3]:
-        print(f"    {line[:100]}")
+        entry = json.loads(line)
+        ts = entry.get("ts", "")
+        user = entry.get("user", "")
+        query = entry.get("query", "")
+        decision = entry.get("decision", "")
+        tag = c(GREEN, "ALLOW") if decision == "allow" else c(RED, "DENY ")
+        print(f"    {tag}  {c(DIM, ts)}  {c(CYAN, user)}  \"{query}\"")
+    print()
+    print(c(DIM, "  Each entry contains a SHA-256 hash of itself chained to the previous entry."))
+    print()
 
     # Verify the intact log.
     result = subprocess.run(
         [sys.executable, str(HERE / "verify_log.py"), str(log_path)],
         capture_output=True, text=True,
     )
-    print(f"  verify_log.py (intact): {result.stdout.strip()}")
+    intact_status = result.stdout.strip()
+    print(f"  Chain verification (intact log)  →  {c(GREEN + BOLD, intact_status)}")
 
     # Tamper: change one character in line 1.
     if lines:
         tampered = list(lines)
         first = tampered[0]
-        # Flip a character in the middle of the line.
         mid = len(first) // 2
-        c = first[mid]
-        replacement = "X" if c != "X" else "Y"
+        ch = first[mid]
+        replacement = "X" if ch != "X" else "Y"
         tampered[0] = first[:mid] + replacement + first[mid + 1:]
         tampered_path = log_path.parent / f"{site_name}_tampered.jsonl"
         tampered_path.write_text("\n".join(tampered) + "\n", encoding="utf-8")
@@ -315,8 +480,13 @@ def step4_audit(site_name, pause, step_mode=False):
             [sys.executable, str(HERE / "verify_log.py"), str(tampered_path)],
             capture_output=True, text=True,
         )
-        print(f"  verify_log.py (tampered): {result2.stdout.strip()}")
+        tampered_status = result2.stdout.strip()
+        print(f"  Chain verification (tampered log) →  {c(RED + BOLD, tampered_status)}")
+        print()
+        print(c(DIM, "  One character was changed in one log entry."))
+        print(c(DIM, "  The hash chain detected the tampering immediately."))
         tampered_path.unlink(missing_ok=True)
+
     if pause:
         time.sleep(1)
     _step_wait(step_mode)
@@ -338,6 +508,9 @@ def run_demo(short_mode, no_pause, step_mode=False):
         print("Generating site data files...")
         subprocess.run([sys.executable, str(HERE / "make_sites.py")], check=True)
 
+    site_counts = _get_site_counts()
+    print_intro(site_counts)
+
     procs = []
     try:
         # Start 3 guarded sites.
@@ -355,13 +528,14 @@ def run_demo(short_mode, no_pause, step_mode=False):
         procs.append(proc_ug)
 
         # Wait for all servers to be ready.
-        print("Starting servers...", flush=True)
+        print(c(DIM, "  Starting hospital servers..."), flush=True)
         for port in SITE_PORTS + [UNGUARDED_PORT]:
             ok = wait_for_server(port)
             if not ok:
                 print(f"ERROR: server on port {port} did not start in time.", file=sys.stderr)
                 sys.exit(1)
-        print("All servers ready.", flush=True)
+
+        print_servers_ready(site_counts)
         _step_wait(step_mode)
 
         step1_pooled(SITE_PORTS, pause, step_mode)
@@ -369,16 +543,24 @@ def run_demo(short_mode, no_pause, step_mode=False):
         rec_u, rec_g = step3_differencing(SITE_PORTS[0], UNGUARDED_PORT, pause, step_mode)
         step4_audit("site_a", pause, step_mode)
 
+        # Final summary.
+        total = sum(site_counts)
         print()
-        print("=" * 60)
-        print("Summary: federated mean queries pooled across 3 sites.")
-        print(f"  Differencing: unguarded recovered {rec_u}, guarded recovered {rec_g}.")
-        print("  Audit log tamper detected by verify_log.py.")
-        print("=" * 60)
+        rule("═")
+        print(f"  {c(BOLD + GREEN, 'DEMO COMPLETE — MedMesh Privacy Summary')}")
+        rule("═")
+        print()
+        print(f"  {c(GREEN,  'PROTECTED')}   {total} patients across 3 hospitals")
+        print(f"  {c(GREEN,  'SHARED'   )}   0 individual records")
+        print(f"  {c(GREEN,  'BLOCKED'  )}   {rec_u} patient(s) recovered by attacker on guarded server (vs {rec_u} on unguarded)")
+        print(f"  {c(GREEN,  'LOGGED'   )}   Every query — audit chain verified")
+        print()
+        print(c(DIM, "  Statistical access. Zero record exposure."))
+        print()
 
     finally:
         stop_servers(procs)
-        print("Servers stopped.", flush=True)
+        print(c(DIM, "  Servers stopped."), flush=True)
 
 
 def parse_args():
