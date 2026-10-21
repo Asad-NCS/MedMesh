@@ -14,10 +14,10 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_URL = "http://127.0.0.1:8000/query"
+SERVER_URL = "http://127.0.0.1:8000/query"
 
 
-def send_query(query, url=DEFAULT_URL, api_key=None):
+def send_query(query, url=SERVER_URL, api_key=None):
     """Send query to one server. Returns parsed response dict."""
     payload = json.dumps({"query": query}).encode("utf-8")
     headers = {"Content-Type": "application/json"}

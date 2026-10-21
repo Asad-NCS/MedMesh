@@ -1,27 +1,4 @@
-"""Institution server: allow statistical summaries, deny disclosive queries.
-
-Flags:
-  --port N         listen port (default 8000)
-  --data PATH      CSV file (default patients.csv next to this script)
-  --site-name NAME label used in audit log (default "default")
-  --no-overlap-guard  disable the per-site overlap guard
-
-API keys:
-  Requests must include X-API-Key header matching keys.json.
-  Missing or wrong key gets deny with reason "invalid or missing API key".
-  Over rate limit gets deny with reason "rate limit exceeded".
-
-Audit log:
-  Each request appended to logs/<site-name>.jsonl as a JSON line.
-  Fields: ts, site, user, query, decision, reason, prev_hash, entry_hash.
-  entry_hash = SHA-256(entry JSON content + prev_hash).
-
-Overlap guard:
-  Per site, across all users, remember patient-id sets behind each
-  allowed query. A new query with set S is denied if some prior set P
-  exists with S != P and |symmetric_difference(S, P)| < MIN_N.
-  An exact repeat of an earlier query set is allowed.
-"""
+"""Institution server: allow statistical summaries, deny disclosive queries."""
 
 import argparse
 import csv
@@ -30,9 +7,13 @@ import json
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from auth import load_keys
+from audit import AuditLog
+from guard import OverlapGuard
 
 MIN_N = 5
 HOST = "127.0.0.1"
@@ -42,7 +23,7 @@ NUMERIC_COLUMNS = {"age", "bmi"}
 GROUP_COLUMNS = {"sex", "diagnosis"}
 IDENTIFYING_COLUMNS = {"id", "name"}
 
-MEAN_WHERE_DIAG = re.compile(r"mean (\w+) where diagnosis = (\w+)")
+MEAN_WHERE = re.compile(r"mean (\w+) where (\w+) = (\w+)")
 MEAN_WHERE_AGE_GT = re.compile(r"mean (\w+) where age > (\d+)")
 MEAN_WHERE_AGE_LT = re.compile(r"mean (\w+) where age < (\d+)")
 MEAN_SIMPLE = re.compile(r"mean (\w+)")
@@ -53,8 +34,7 @@ KEYS_PATH = Path(__file__).with_name("keys.json")
 
 
 def load_patients(path=DATA_PATH):
-    """Load CSV and cast numeric columns."""
-    with Path(path).open(newline="", encoding="utf-8") as handle:
+    with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     for row in rows:
         row["age"] = float(row["age"])
@@ -62,16 +42,7 @@ def load_patients(path=DATA_PATH):
     return rows
 
 
-# Module-level PATIENTS for backward compatibility with test_queries.py.
 PATIENTS = load_patients()
-
-
-def load_keys():
-    """Load API keys from keys.json. Returns empty dict if file missing."""
-    if not KEYS_PATH.exists():
-        return {}
-    with KEYS_PATH.open(encoding="utf-8") as fh:
-        return json.load(fh)
 
 
 def deny(reason):
@@ -107,12 +78,12 @@ class SiteState:
     """Holds per-site mutable state: patients, keys, rate limiter, overlap guard, log."""
 
     def __init__(self, data_path, site_name, overlap_guard_enabled):
-        self.patients = load_patients(data_path)
+        self.patients = load_patients(Path(data_path))
         self.site_name = site_name
         self.overlap_guard_enabled = overlap_guard_enabled
-        self.keys_data = load_keys()
+        self.keys_data = load_keys(KEYS_PATH)
         self._rate_lock = threading.Lock()
-        # rate_counts[user] = [timestamp, ...]
+        # _rate_counts[user] = [timestamp, ...]
         self._rate_counts = defaultdict(list)
         self._overlap_lock = threading.Lock()
         # List of frozensets of patient ids from previous allowed queries.
@@ -126,7 +97,6 @@ class SiteState:
     def check_key(self, key_value):
         """Return (user, deny_response_or_None)."""
         if not self.keys_data:
-            # No keys file: allow all with user "anonymous".
             return "anonymous", None
         if not key_value:
             return None, deny("invalid or missing API key")
@@ -146,7 +116,6 @@ class SiteState:
         now = time.time()
         with self._rate_lock:
             stamps = self._rate_counts[user]
-            # Keep only the last 60 seconds.
             stamps[:] = [t for t in stamps if now - t < 60]
             if len(stamps) >= limit:
                 return deny("rate limit exceeded")
@@ -160,7 +129,6 @@ class SiteState:
         with self._overlap_lock:
             for prior in self._seen_sets:
                 if new_set == prior:
-                    # Exact repeat is fine.
                     return None
                 diff = new_set.symmetric_difference(prior)
                 if len(diff) < MIN_N:
@@ -207,25 +175,7 @@ def process_query(text, state):
     if asks_for_records(query):
         return deny("query asks for individual patient records")
 
-    # mean X where diagnosis = Y
-    where_diag = MEAN_WHERE_DIAG.fullmatch(query)
-    if where_diag:
-        column, value = where_diag.groups()
-        if column in IDENTIFYING_COLUMNS:
-            return deny("query asks for individual patient records")
-        if column not in NUMERIC_COLUMNS:
-            return deny("query is not an allowed statistical summary")
-        matched = [row for row in patients if row["diagnosis"].lower() == value]
-        if len(matched) < MIN_N:
-            return deny("result covers fewer than 5 patients")
-        ids = patient_ids(matched)
-        overlap_resp = state.check_overlap(ids)
-        if overlap_resp:
-            return overlap_resp
-        state.record_set(ids)
-        return mean_result(column, matched)
-
-    # mean X where age > N
+    # mean X where age > N  (new filter -- checked before generic MEAN_WHERE)
     where_age_gt = MEAN_WHERE_AGE_GT.fullmatch(query)
     if where_age_gt:
         column, threshold_str = where_age_gt.groups()
@@ -244,7 +194,7 @@ def process_query(text, state):
         state.record_set(ids)
         return mean_result(column, matched)
 
-    # mean X where age < N
+    # mean X where age < N  (new filter -- checked before generic MEAN_WHERE)
     where_age_lt = MEAN_WHERE_AGE_LT.fullmatch(query)
     if where_age_lt:
         column, threshold_str = where_age_lt.groups()
@@ -263,7 +213,23 @@ def process_query(text, state):
         state.record_set(ids)
         return mean_result(column, matched)
 
-    # mean X (simple)
+    where_match = MEAN_WHERE.fullmatch(query)
+    if where_match:
+        column, field, value = where_match.groups()
+        if column in IDENTIFYING_COLUMNS or field in IDENTIFYING_COLUMNS:
+            return deny("query asks for individual patient records")
+        if column not in NUMERIC_COLUMNS or field != "diagnosis":
+            return deny("query is not an allowed statistical summary")
+        matched = [row for row in patients if row["diagnosis"].lower() == value]
+        if len(matched) < MIN_N:
+            return deny("result covers fewer than 5 patients")
+        ids = patient_ids(matched)
+        overlap_resp = state.check_overlap(ids)
+        if overlap_resp:
+            return overlap_resp
+        state.record_set(ids)
+        return mean_result(column, matched)
+
     mean_match = MEAN_SIMPLE.fullmatch(query)
     if mean_match:
         column = mean_match.group(1)
@@ -292,7 +258,6 @@ def process_query(text, state):
             return deny("query asks for individual patient records")
         if column not in GROUP_COLUMNS:
             return deny("query is not an allowed statistical summary")
-        from collections import Counter
         counts = Counter(row[column] for row in patients)
         if any(count < MIN_N for count in counts.values()):
             return deny("result covers fewer than 5 patients")
@@ -307,9 +272,12 @@ def process_query(text, state):
 
 
 def make_handler(state):
-    """Return a BaseHTTPRequestHandler class bound to the given SiteState."""
+    """Return a BaseHTTPRequestHandler class bound to the given SiteState.
 
-    class QueryHandler(BaseHTTPRequestHandler):
+    Used by test_medmesh.py and by serve() when launching named sites.
+    """
+
+    class _BoundHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path != "/query":
                 self._send(404, deny("query is not an allowed statistical summary"))
@@ -359,28 +327,57 @@ def make_handler(state):
         def log_message(self, fmt, *args):
             return
 
-    return QueryHandler
+    return _BoundHandler
 
 
-# Keep old-style QueryHandler for test_queries.py compatibility.
-# test_queries.py does:  from server import HOST, PATIENTS, QueryHandler, ThreadingHTTPServer
-# The default QueryHandler uses the module-level PATIENTS (patients.csv).
-_default_state = None
+# Module-level QueryHandler for test_queries.py compatibility.
+# test_queries.py does: from server import HOST, PATIENTS, QueryHandler, ThreadingHTTPServer
+# It uses no API keys so we create a keyless default state once on first use.
+_compat_state = None
 
 
-def _get_default_state():
-    global _default_state
-    if _default_state is None:
-        _default_state = SiteState(DATA_PATH, "default", overlap_guard_enabled=True)
-        # Patch its patients to use the module-level PATIENTS list so
-        # test_queries.py's response_is_safe() (which uses PATIENTS) sees the same data.
-        _default_state.patients = PATIENTS
-        # Clear keys so the legacy test_queries.py (unauthenticated) still passes.
-        _default_state.keys_data = {}
-    return _default_state
+def _get_compat_state():
+    global _compat_state
+    if _compat_state is None:
+        _compat_state = SiteState(DATA_PATH, "default", overlap_guard_enabled=False)
+        # Override with module-level PATIENTS (same object test_queries.py imports).
+        _compat_state.patients = PATIENTS
+        # Clear keys so unauthenticated test_queries.py requests pass.
+        _compat_state.keys_data = {}
+    return _compat_state
 
 
-QueryHandler = make_handler(_get_default_state())
+class QueryHandler(BaseHTTPRequestHandler):
+    """Top-level QueryHandler using module-level PATIENTS and no API keys.
+
+    Kept as a real top-level class so test_queries.py can import it directly.
+    """
+
+    def do_POST(self):
+        state = _get_compat_state()
+        if self.path != "/query":
+            self._send(404, deny("query is not an allowed statistical summary"))
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+            query = body["query"]
+        except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError):
+            self._send(200, deny("query is not an allowed statistical summary"))
+            return
+        self._send(200, process_query(query, state))
+
+    def _send(self, status, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        return
 
 
 def serve(port=PORT, data_path=DATA_PATH, site_name="default", overlap_guard=True):
@@ -388,7 +385,7 @@ def serve(port=PORT, data_path=DATA_PATH, site_name="default", overlap_guard=Tru
     state = SiteState(data_path, site_name, overlap_guard)
     handler_class = make_handler(state)
     server = ThreadingHTTPServer((HOST, port), handler_class)
-    print(f"listening on http://{HOST}:{port} site={site_name}", flush=True)
+    print(f"listening on http://{HOST}:{port}", flush=True)
     server.serve_forever()
 
 
