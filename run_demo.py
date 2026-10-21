@@ -6,7 +6,8 @@ Always shuts down cleanly (terminate, then kill after 3 seconds) in a finally bl
 
 Flags:
   --short    2-minute version: under 90 seconds, no pauses.
-  --no-pause skip all pauses (same effect as --short for pauses).
+  --no-pause skip all pauses.
+  --step     pause for Enter after server startup and after each step.
   --check    preflight: check ports, data files, keys.json, run tests.
 """
 
@@ -163,7 +164,13 @@ def preflight():
         print("READY")
 
 
-def step1_pooled(ports, pause):
+def _step_wait(step_mode):
+    """If step_mode is on, print a prompt and wait for Enter."""
+    if step_mode:
+        input("(press Enter)")
+
+
+def step1_pooled(ports, pause, step_mode=False):
     """Step 1: pooled mean age and count by sex."""
     banner(1, "Pooled queries across 3 sites: mean age, count by sex.")
     for query in ["mean age", "count by sex"]:
@@ -194,9 +201,10 @@ def step1_pooled(ports, pause):
                 print(f"    Pooled: n={pooled_n}, counts={pooled_counts}")
     if pause:
         time.sleep(1)
+    _step_wait(step_mode)
 
 
-def step2_refusals(ports, pause):
+def step2_refusals(ports, pause, step_mode=False):
     """Step 2: show refusals (all records, rare group, no key)."""
     banner(2, "Refusals: all records, rare group, and no API key.")
     queries = [
@@ -210,9 +218,10 @@ def step2_refusals(ports, pause):
         print(f"  {query!r} key={key is not None} -> {resp.get('decision')}: {resp.get('reason', '')}")
     if pause:
         time.sleep(1)
+    _step_wait(step_mode)
 
 
-def step3_differencing(guarded_port, unguarded_port, pause):
+def step3_differencing(guarded_port, unguarded_port, pause, step_mode=False):
     """Step 3: differencing attack on unguarded then guarded server."""
     import csv as _csv
     banner(3, "Differencing attack: unguarded vs guarded server.")
@@ -267,10 +276,11 @@ def step3_differencing(guarded_port, unguarded_port, pause):
     print(f"  Guarded   (:{guarded_port}): {att_g} attempts, {blk_g} blocked, {rec_g} patient(s) recovered")
     if pause:
         time.sleep(1)
+    _step_wait(step_mode)
     return rec_u, rec_g
 
 
-def step4_audit(site_name, pause):
+def step4_audit(site_name, pause, step_mode=False):
     """Step 4: show 3 log lines, tamper one, run verify_log.py."""
     banner(4, "Audit log: tamper detection.")
     log_path = HERE / "logs" / f"{site_name}.jsonl"
@@ -309,9 +319,10 @@ def step4_audit(site_name, pause):
         tampered_path.unlink(missing_ok=True)
     if pause:
         time.sleep(1)
+    _step_wait(step_mode)
 
 
-def run_demo(short_mode, no_pause):
+def run_demo(short_mode, no_pause, step_mode=False):
     """Run the full demo."""
     pause = not short_mode and not no_pause
 
@@ -351,11 +362,12 @@ def run_demo(short_mode, no_pause):
                 print(f"ERROR: server on port {port} did not start in time.", file=sys.stderr)
                 sys.exit(1)
         print("All servers ready.", flush=True)
+        _step_wait(step_mode)
 
-        step1_pooled(SITE_PORTS, pause)
-        step2_refusals(SITE_PORTS, pause)
-        rec_u, rec_g = step3_differencing(SITE_PORTS[0], UNGUARDED_PORT, pause)
-        step4_audit("site_a", pause)
+        step1_pooled(SITE_PORTS, pause, step_mode)
+        step2_refusals(SITE_PORTS, pause, step_mode)
+        rec_u, rec_g = step3_differencing(SITE_PORTS[0], UNGUARDED_PORT, pause, step_mode)
+        step4_audit("site_a", pause, step_mode)
 
         print()
         print("=" * 60)
@@ -371,9 +383,22 @@ def run_demo(short_mode, no_pause):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MedMesh demo runner")
-    parser.add_argument("--short", action="store_true")
-    parser.add_argument("--no-pause", action="store_true")
-    parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--short", action="store_true",
+        help="2-minute version: run all steps without pauses, finish under 90 seconds"
+    )
+    parser.add_argument(
+        "--no-pause", action="store_true",
+        help="skip the 1-second pause between steps (no effect on --step waits)"
+    )
+    parser.add_argument(
+        "--step", action="store_true",
+        help="pause for Enter after server startup and after each step"
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="preflight check: verify ports, data files, keys.json, and run tests"
+    )
     return parser.parse_args()
 
 
@@ -382,7 +407,7 @@ def main():
     if args.check:
         preflight()
         return
-    run_demo(short_mode=args.short, no_pause=args.no_pause)
+    run_demo(short_mode=args.short, no_pause=args.no_pause, step_mode=args.step)
 
 
 if __name__ == "__main__":
