@@ -1,0 +1,14 @@
+{
+  "researcher_ana": {
+    "key": "key_ana_secure_001",
+    "limit": 30
+  },
+  "researcher_bob": {
+    "key": "key_bob_secure_002",
+    "limit": 30
+  },
+  "researcher_mallory": {
+    "key": "key_mallory_003",
+    "limit": 1000
+  }
+}
